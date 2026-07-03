@@ -68,6 +68,16 @@
                             <outputDirectory>${project.build.directory}${file.separator}distribution-base${file.separator}plugins</outputDirectory>
                             <destFileName>search.jar</destFileName>
                         </artifactItem>
+                        <artifactItem>
+                            <groupId>org.igniterealtime.openfire.plugins</groupId>
+                            <artifactId>spaces</artifactId>
+                            <version>${project.version}</version>
+                            <type>jar</type>
+                            <classifier>openfire-plugin-assembly</classifier>
+                            <overWrite>true</overWrite>
+                            <outputDirectory>${project.build.directory}${file.separator}distribution-base${file.separator}plugins</outputDirectory>
+                            <destFileName>spaces.jar</destFileName>
+                        </artifactItem>
                     </artifactItems>
                 </configuration>
             </plugin>
@@ -127,6 +137,14 @@
             <groupId>org.igniterealtime.openfire.plugins</groupId>
             <artifactId>search</artifactId>
             <version>1.8.0</version>
+            <classifier>openfire-plugin-assembly</classifier>
+            <scope>provided</scope>
+        </dependency>
+        <!-- spaces is a dependency, but has to be renamed and placed in the plugins folder so is explicitly copied -->
+        <dependency>
+            <groupId>org.igniterealtime.openfire.plugins</groupId>
+            <artifactId>spaces</artifactId>
+            <version>${project.version}</version>
             <classifier>openfire-plugin-assembly</classifier>
             <scope>provided</scope>
         </dependency>

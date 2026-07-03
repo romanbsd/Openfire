@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin>
+    <class>org.jivesoftware.openfire.plugin.spaces.SpacesPlugin</class>
+    <name>Spaces</name>
+    <description>Implements XEP-0503 Server-side Spaces using a dedicated spaces.&lt;domain&gt; PubSub service. Requires JDK 21+.</description>
+    <author>Ignite Realtime</author>
+    <version>1.0.0-SNAPSHOT</version>
+    <date>07/04/2026</date>
+    <minServerVersion>5.2.0</minServerVersion>
+    <licenseType>apache</licenseType>
+</plugin>

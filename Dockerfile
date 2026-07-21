@@ -1,79 +1,108 @@
-# This stage extracts all the pom.xml files.
-# It'll get rebuilt with any source change, but that's OK.
-# It doesn't matter what image we're using, really, so we may as well use one of the same images as elsewhere.
-FROM eclipse-temurin:25-jre AS poms
-WORKDIR /usr/src
-COPY . .
-# Wipe any files not called pom.xml or *.jar
-RUN find . -type f -and \! -name pom.xml -and \! -name '*.jar' -delete
-# Clear up any (now) empty diretories
-RUN find . -type d -empty -delete
+# syntax=docker/dockerfile:1
 
-# Now we build:
+ARG OPENFIRE_VERSION=5.2.0-SNAPSHOT
+ARG HTTPFILEUPLOAD_PLUGIN_VERSION=1.5.0
+ARG MONITORING_GIT_URL=https://github.com/romanbsd/openfire-monitoring-plugin.git
+ARG MONITORING_GIT_REF=main
+ARG RESTAPI_GIT_URL=https://github.com/igniterealtime/openfire-restAPI-plugin.git
+ARG RESTAPI_GIT_REF=main
+
 FROM eclipse-temurin:25 AS build
-WORKDIR /tmp/
+ARG OPENFIRE_VERSION
+ARG HTTPFILEUPLOAD_PLUGIN_VERSION
+ARG MONITORING_GIT_URL
+ARG MONITORING_GIT_REF
+ARG RESTAPI_GIT_URL
+ARG RESTAPI_GIT_REF
+
+ENV MAVEN_OPTS="-Daether.dependencyCollector.impl=bf -Dmaven.artifact.threads=10 -Daether.dependencyCollector.bf.threads=10"
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends curl git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src
-COPY mvnw ./
-RUN chmod +x mvnw
-RUN mkdir -p .mvn
-COPY .mvn/wrapper .mvn/wrapper
-
-# First, copy in the pom.xml files (and any checked-in jars) and fetch the dependencies into a real image layer.
-# This layer depends on the POMs, the checked-in jars, and the Maven wrapper (copied above), so it stays cached
-# until one of those changes; dependency downloads are reused whenever the source changes but those inputs don't.
-COPY --from=poms /usr/src/ .
-# I don't know why we need all three either.
-RUN ./mvnw -e -B dependency:resolve-plugins -Dmaven.test.skip -Dmaven.repo.local=/tmp/m2_repo
-RUN ./mvnw -e -B de.qaware.maven:go-offline-maven-plugin:resolve-dependencies -Dmaven.repo.local=/tmp/m2_repo
-# The go-offline plugin and dependency:resolve-plugins do not reliably resolve BOM POMs referenced
-# via <scope>import</scope> in <dependencyManagement>. Fetch them explicitly so they are present
-# in the repository before the offline build runs. Add any newly introduced BOMs here in the same way.
-RUN ./mvnw -e -B dependency:get -DgroupId=org.codehaus.plexus -DartifactId=plexus-utils -Dpackaging=jar -Dversion=1.1 -Dmaven.repo.local=/tmp/m2_repo && \
-    ./mvnw -e -B dependency:get -DgroupId=org.junit -DartifactId=junit-bom -Dpackaging=pom -Dversion=6.1.0 -Dmaven.repo.local=/tmp/m2_repo && \
-    ./mvnw -e -B dependency:get -DgroupId=org.mockito -DartifactId=mockito-bom -Dpackaging=pom -Dversion=5.23.0 -Dmaven.repo.local=/tmp/m2_repo
-
-# Above here is affected only by the POMs, checked-in jars, and the Maven wrapper, so the layer is usually stable.
-
-# Now, copy in all the source, and actually build it, skipping the tests.
 COPY . .
-RUN ./mvnw -e -B install -Dmaven.test.skip -Dmaven.repo.local=/tmp/m2_repo
-# In case of Windows, break glass.
-RUN sed -i 's/\r//g' /usr/src/distribution/target/distribution-base/bin/openfire.sh
+RUN chmod +x mvnw
+RUN git clone --depth 1 --branch "${MONITORING_GIT_REF}" "${MONITORING_GIT_URL}" plugins/monitoring \
+    && git clone --depth 1 --branch "${RESTAPI_GIT_REF}" "${RESTAPI_GIT_URL}" plugins/restAPI \
+    && sed -i "0,/<version>[^<]*<\/version>/s//<version>${OPENFIRE_VERSION}<\/version>/" plugins/monitoring/pom.xml \
+    && sed -i "0,/<version>[^<]*<\/version>/s//<version>${OPENFIRE_VERSION}<\/version>/" plugins/restAPI/pom.xml \
+    && sed -i 's|<module>spaces</module>|<module>spaces</module><module>monitoring</module><module>restAPI</module>|' plugins/pom.xml
 
-# Might as well create the user in a different stage if only to eliminate
-# the ugly && chaining and increase parallelization
-FROM eclipse-temurin:25-jre AS skeleton-runtime
+RUN --mount=type=cache,target=/root/.m2,id=openfire-maven \
+    ./mvnw -e -B install \
+        -pl distribution,plugins/spaces,plugins/monitoring,plugins/restAPI -am \
+        -Dmaven.test.skip
+
+RUN mkdir -p /opt/plugins \
+    && curl -fsSL -o /opt/plugins/httpfileupload.jar \
+        "https://www.igniterealtime.org/projects/openfire/plugins/${HTTPFILEUPLOAD_PLUGIN_VERSION}/httpfileupload.jar" \
+    && SPACES_JAR="$(find plugins/spaces/target -type f -name '*-openfire-plugin-assembly.jar' -print -quit)" \
+    && MONITORING_JAR="$(find plugins/monitoring/target -type f -name '*-openfire-plugin-assembly.jar' -print -quit)" \
+    && RESTAPI_JAR="$(find plugins/restAPI/target -type f -name '*-openfire-plugin-assembly.jar' -print -quit)" \
+    && test -f "${SPACES_JAR}" \
+    && test -f "${MONITORING_JAR}" \
+    && test -f "${RESTAPI_JAR}" \
+    && cp "${SPACES_JAR}" /opt/plugins/spaces.jar \
+    && cp "${MONITORING_JAR}" /opt/plugins/monitoring.jar \
+    && cp "${RESTAPI_JAR}" /opt/plugins/restAPI.jar \
+    && test -s /opt/plugins/httpfileupload.jar
+
+# Normalize the launcher when the build context came from a Windows checkout.
+RUN sed -i 's/\r//g' distribution/target/distribution-base/bin/openfire.sh
+
+FROM build AS archive
+ARG OPENFIRE_VERSION
+
+RUN mkdir -p /opt/archive/openfire/plugins /opt/distribution \
+    && cp -a distribution/target/distribution-base/. /opt/archive/openfire/ \
+    && cp /opt/plugins/*.jar /opt/archive/openfire/plugins/ \
+    && test -s /opt/archive/openfire/plugins/spaces.jar \
+    && test -s /opt/archive/openfire/plugins/restAPI.jar \
+    && test -s /opt/archive/openfire/plugins/httpfileupload.jar \
+    && test -s /opt/archive/openfire/plugins/monitoring.jar \
+    && tar -czf "/opt/distribution/openfire-${OPENFIRE_VERSION}.tar.gz" \
+        -C /opt/archive openfire
+
+FROM scratch AS distribution
+COPY --from=archive /opt/distribution/ /
+
+FROM eclipse-temurin:25-jre-alpine AS runtime
+ARG OPENFIRE_VERSION
 
 ENV OPENFIRE_USER=openfire \
     OPENFIRE_DIR=/usr/local/openfire \
     OPENFIRE_DATA_DIR=/var/lib/openfire \
-    OPENFIRE_LOG_DIR=/var/log/openfire
+    OPENFIRE_LOG_DIR=/var/log/openfire \
+    OPENFIRE_VERSION="${OPENFIRE_VERSION}"
 
-RUN apt-get update -qq
-RUN apt-get install -yyq adduser
-RUN adduser --disabled-password --quiet --system --home $OPENFIRE_DATA_DIR --gecos "Openfire XMPP server" --group $OPENFIRE_USER
+RUN apk add --no-cache bash curl su-exec \
+    && addgroup -S "${OPENFIRE_USER}" \
+    && adduser -S -G "${OPENFIRE_USER}" -h "${OPENFIRE_DATA_DIR}" -s /sbin/nologin "${OPENFIRE_USER}"
 
-# Final stage, build the runtime container:
-FROM eclipse-temurin:25-jre AS runtime
+COPY --chmod=0755 build/docker/entrypoint.sh /sbin/entrypoint.sh
+COPY --chown=${OPENFIRE_USER}:${OPENFIRE_USER} --from=build \
+    /usr/src/distribution/target/distribution-base ${OPENFIRE_DIR}
+COPY --from=build /opt/plugins /opt/plugins
 
-ENV OPENFIRE_USER=openfire \
-    OPENFIRE_DIR=/usr/local/openfire \
-    OPENFIRE_DATA_DIR=/var/lib/openfire \
-    OPENFIRE_LOG_DIR=/var/log/openfire
+RUN test -s /opt/plugins/spaces.jar \
+    && test -s /opt/plugins/restAPI.jar \
+    && test -s /opt/plugins/httpfileupload.jar \
+    && test -s /opt/plugins/monitoring.jar \
+    && mv "${OPENFIRE_DIR}/conf" "${OPENFIRE_DIR}/conf_org" \
+    && mv "${OPENFIRE_DIR}/plugins" "${OPENFIRE_DIR}/plugins_org" \
+    && mv "${OPENFIRE_DIR}/resources/security" "${OPENFIRE_DIR}/resources/security_org"
 
-COPY --from=skeleton-runtime /etc/passwd /etc/shadow /etc/group /etc/
-COPY --chown=$OPENFIRE_USER:$OPENFIRE_USER --from=skeleton-runtime $OPENFIRE_DATA_DIR $OPENFIRE_DATA_DIR
-COPY --chmod=0755 --from=build /usr/src/build/docker/entrypoint.sh /sbin/entrypoint.sh
-COPY --chown=$OPENFIRE_USER:$OPENFIRE_USER --from=build /usr/src/distribution/target/distribution-base /usr/local/openfire
-RUN mv ${OPENFIRE_DIR}/conf ${OPENFIRE_DIR}/conf_org \
-    && mv ${OPENFIRE_DIR}/plugins ${OPENFIRE_DIR}/plugins_org \
-    && mv ${OPENFIRE_DIR}/resources/security ${OPENFIRE_DIR}/resources/security_org
+LABEL org.opencontainers.image.title="Openfire" \
+      org.opencontainers.image.version="${OPENFIRE_VERSION}" \
+      org.opencontainers.image.description="Openfire on Eclipse Temurin JDK 25 Alpine with Spaces, REST API, HTTP File Upload, and Monitoring plugins." \
+      org.opencontainers.image.source="https://github.com/romanbsd/Openfire"
 
-LABEL org.opencontainers.image.authors="dave@cridland.net,dan@caseley.me.uk"
-WORKDIR /usr/local/openfire
-HEALTHCHECK --interval=1m --timeout=10s --start-period=3m --retries=3  CMD bash -c "(echo > /dev/tcp/localhost/5222) 2>/dev/null || exit 1"
+WORKDIR ${OPENFIRE_DIR}
+HEALTHCHECK --interval=30s --timeout=10s --start-period=3m --retries=5 \
+    CMD curl -fsS http://127.0.0.1:9090/login.jsp >/dev/null || exit 1
 
 EXPOSE 3478 3479 5005 5222 5223 5229 5262 5263 5275 5276 7070 7443 7777 9090 9091
-VOLUME ["${OPENFIRE_DATA_DIR}"]
-VOLUME ["${OPENFIRE_LOG_DIR}"]
-ENTRYPOINT [ "/sbin/entrypoint.sh" ]
+VOLUME ["/var/lib/openfire", "/var/log/openfire"]
+ENTRYPOINT ["/sbin/entrypoint.sh"]
